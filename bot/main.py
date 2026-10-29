@@ -17,9 +17,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 from bot.agents import Orchestrator, create_ticket
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
+# httpx logs every request URL at INFO, and Telegram URLs contain the bot token
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 RATE_LIMIT = 8  # messages per minute per chat
+MAX_INPUT_CHARS = 1500  # longer messages are refused, so nobody can burn tokens with huge pastes
 _hits = defaultdict(list)
 
 
@@ -31,10 +34,18 @@ def load_env(path=Path(__file__).resolve().parent.parent / ".env"):
                 os.environ.setdefault(key.strip(), value.strip())
 
 
-def allowed(chat_id):
-    now = time.time()
+def allowed(chat_id, now=None):
+    now = now or time.time()
     _hits[chat_id] = [t for t in _hits[chat_id] if now - t < 60] + [now]
-    return len(_hits[chat_id]) <= RATE_LIMIT
+    for other in [c for c, hits in _hits.items() if now - hits[-1] >= 60]:
+        del _hits[other]  # forget idle chats so the table can't grow forever
+    return len(_hits.get(chat_id, ())) <= RATE_LIMIT
+
+
+def allowed_chats():
+    """Optional allowlist: ALLOWED_CHAT_IDS=123,456 limits the bot to these chats (empty = everyone)."""
+    raw = os.environ.get("ALLOWED_CHAT_IDS", "")
+    return {int(x) for x in raw.replace(" ", "").split(",") if x.lstrip("-").isdigit()}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -60,6 +71,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(chat_id):
         await update.message.reply_text("⏳ Too many messages, please wait a minute.")
         return
+    if len(update.message.text) > MAX_INPUT_CHARS:
+        await update.message.reply_text(f"✂️ That message is too long - please keep it under {MAX_INPUT_CHARS} characters.")
+        return
     await context.bot.send_chat_action(chat_id, ChatAction.TYPING)
     try:
         # the Claude calls are blocking; run them off the event loop so other chats stay responsive
@@ -78,10 +92,14 @@ def main():
         raise SystemExit("Set TELEGRAM_BOT_TOKEN and ANTHROPIC_API_KEY (copy .env.example to .env).")
     app = Application.builder().token(token).build()
     app.bot_data["orchestrator"] = Orchestrator(Anthropic())
-    app.add_handler(CommandHandler(["start", "help"], start))
-    app.add_handler(CommandHandler("reset", reset))
-    app.add_handler(CommandHandler("human", human))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    chats = allowed_chats()
+    who = filters.Chat(chat_id=chats) if chats else filters.ALL  # other chats are silently ignored
+    app.add_handler(CommandHandler(["start", "help"], start, filters=who))
+    app.add_handler(CommandHandler("reset", reset, filters=who))
+    app.add_handler(CommandHandler("human", human, filters=who))
+    app.add_handler(MessageHandler(who & filters.TEXT & ~filters.COMMAND, on_text))
+    if chats:
+        log.info("Allowlist on: %d chat(s).", len(chats))
     log.info("Bot running. Ctrl+C to stop.")
     app.run_polling()
 
