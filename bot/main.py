@@ -18,7 +18,8 @@ from bot.agents import Orchestrator, create_ticket
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 # httpx logs every request URL at INFO, and Telegram URLs contain the bot token
-logging.getLogger("httpx").setLevel(logging.WARNING)
+for noisy in ("httpx", "httpx2"):  # httpx2 is the Anthropic SDK's client
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
 RATE_LIMIT = 8  # messages per minute per chat
